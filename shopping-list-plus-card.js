@@ -1,14 +1,12 @@
 /**
- * Shopping List Plus Card
+ * Shopping List Plus Card  —  v1.1
  * Um custom card para o Home Assistant que assenta numa entidade `todo`
- * (ex.: todo.shopping_list) e adiciona pesquisa, filtros por tag e
- * agrupamento por categoria — sem precisar de backend nenhum.
+ * (ex.: todo.shopping_list) e adiciona pesquisa, filtros por tag,
+ * agrupamento, quantidades e sugestões enquanto escreves.
  *
- * Convenção: usa tags com # no nome do artigo, ex.:
- *   "Leite #laticinios #continente"
- * O card extrai as tags, mostra o nome limpo + badges, e dá-te chips de
- * filtro. As tags ficam guardadas no próprio `summary` do item, por isso
- * fazem round-trip e aparecem em qualquer outro sítio do HA.
+ * Convenções guardadas no `summary` do item (round-trip e visíveis em todo o HA):
+ *   - tags:        "Leite #laticinios #continente"
+ *   - quantidade:  prefixo "2x ", ex.: "2x Leite #laticinios"
  *
  * Config mínima (YAML):
  *   type: custom:shopping-list-plus-card
@@ -24,6 +22,7 @@
  */
 
 const TAG_RE = /#([\p{L}\p{N}_-]+)/gu;
+const QTY_RE = /^\s*(\d{1,3})\s*[x×*]?\s+/; // não-global de propósito
 
 class ShoppingListPlusCard extends HTMLElement {
   constructor() {
@@ -39,6 +38,10 @@ class ShoppingListPlusCard extends HTMLElement {
     this._chromeBuilt = false;
     this._subscribedEntity = null;
     this._unsub = null;
+    this._catalog = {};
+    this._seeded = false;
+    this._suggestions = [];
+    this._sugIndex = -1;
   }
 
   /* ---------------- Lovelace lifecycle ---------------- */
@@ -60,6 +63,7 @@ class ShoppingListPlusCard extends HTMLElement {
     this._groupByCategory = !!this._config.group_by_category;
     this._showCompleted = this._config.show_completed !== false;
     this._loadPrefs();
+    this._loadCatalog();
     this._buildChrome();
     this._applyAccent();
   }
@@ -70,6 +74,7 @@ class ShoppingListPlusCard extends HTMLElement {
     if (this._subscribedEntity !== this._config.entity) {
       this._teardown();
       this._subscribedEntity = this._config.entity;
+      this._seeded = false;
       this._subscribe();
     }
   }
@@ -91,24 +96,23 @@ class ShoppingListPlusCard extends HTMLElement {
   async _subscribe() {
     if (!this._hass || !this._config) return;
     const entity_id = this._config.entity;
+    const onItems = (items) => {
+      this._items = items || [];
+      this._loaded = true;
+      this._error = null;
+      if (!this._seeded) { this._catalogSeed(); this._seeded = true; }
+      this._renderDynamic();
+    };
     try {
       const unsub = await this._hass.connection.subscribeMessage(
-        (msg) => {
-          this._items = (msg && msg.items) || [];
-          this._loaded = true;
-          this._error = null;
-          this._renderDynamic();
-        },
+        (msg) => onItems(msg && msg.items),
         { type: "todo/item/subscribe", entity_id }
       );
       this._unsub = unsub;
     } catch (e) {
-      // Fallback: fetch one-shot if subscription isn't supported
       try {
         const res = await this._hass.callWS({ type: "todo/item/list", entity_id });
-        this._items = (res && res.items) || [];
-        this._loaded = true;
-        this._renderDynamic();
+        onItems(res && res.items);
       } catch (e2) {
         this._error = e2;
         this._renderDynamic();
@@ -129,10 +133,14 @@ class ShoppingListPlusCard extends HTMLElement {
     });
   }
 
-  _addItem(raw) {
-    const summary = raw.trim();
-    if (!summary) return;
+  _addItem(rawName, qty) {
+    let name = (rawName || "").trim();
+    if (!name) return;
+    qty = Math.max(1, parseInt(qty, 10) || 1);
+    const hasPrefix = QTY_RE.test(name);
+    const summary = qty > 1 && !hasPrefix ? `${qty}x ${name}` : name;
     this._callService("add_item", { item: summary });
+    this._catalogAdd(name);
   }
 
   _toggleItem(uid, status) {
@@ -140,6 +148,12 @@ class ShoppingListPlusCard extends HTMLElement {
       item: uid,
       status: status === "completed" ? "needs_action" : "completed",
     });
+  }
+
+  _setQty(uid, summary, qty) {
+    const stripped = (summary || "").replace(QTY_RE, "");
+    const newSummary = qty > 1 ? `${qty}x ${stripped}` : stripped;
+    this._callService("update_item", { item: uid, rename: newSummary });
   }
 
   _removeItem(uid) {
@@ -150,22 +164,26 @@ class ShoppingListPlusCard extends HTMLElement {
 
   _parse(item) {
     const summary = item.summary || "";
+    let qty = 1;
+    let rest = summary;
+    const qm = summary.match(QTY_RE);
+    if (qm) { qty = parseInt(qm[1], 10) || 1; rest = summary.slice(qm[0].length); }
+
     const tags = new Set();
     let m;
     TAG_RE.lastIndex = 0;
-    while ((m = TAG_RE.exec(summary)) !== null) tags.add(m[1].toLowerCase());
+    while ((m = TAG_RE.exec(rest)) !== null) tags.add(m[1].toLowerCase());
     if (item.description) {
-      item.description
-        .split(/[,;]/)
-        .map((s) => s.trim().toLowerCase())
-        .filter(Boolean)
-        .forEach((t) => tags.add(t));
+      item.description.split(/[,;]/).map((s) => s.trim().toLowerCase())
+        .filter(Boolean).forEach((t) => tags.add(t));
     }
-    const name = summary.replace(TAG_RE, "").replace(/\s{2,}/g, " ").trim();
+    const name = rest.replace(TAG_RE, "").replace(/\s{2,}/g, " ").trim();
     return {
       uid: item.uid,
-      name: name || summary,
+      summary,
+      name: name || rest || summary,
       tags: [...tags],
+      qty,
       status: item.status,
       done: item.status === "completed",
     };
@@ -182,16 +200,14 @@ class ShoppingListPlusCard extends HTMLElement {
       if (it.tags.length === 0) hasUncategorized = true;
       it.tags.forEach((t) => set.add(t));
     }
-    const tags = [...set].sort((a, b) => a.localeCompare(b, "pt"));
-    return { tags, hasUncategorized };
+    return { tags: [...set].sort((a, b) => a.localeCompare(b, "pt")), hasUncategorized };
   }
 
   _matchesFilters(it) {
     if (!this._showCompleted && it.done) return false;
     if (this._search) {
       const q = this._search.toLowerCase();
-      if (!it.name.toLowerCase().includes(q) &&
-          !it.tags.some((t) => t.includes(q))) return false;
+      if (!it.name.toLowerCase().includes(q) && !it.tags.some((t) => t.includes(q))) return false;
     }
     if (this._activeTags.size > 0) {
       const wantsUncat = this._activeTags.has("__uncat__");
@@ -202,11 +218,114 @@ class ShoppingListPlusCard extends HTMLElement {
     return true;
   }
 
+  /* ---------------- Catalog (type-ahead memory) ---------------- */
+
+  _cleanName(raw) {
+    const rest = (raw || "").replace(QTY_RE, "");
+    return rest.replace(TAG_RE, "").replace(/\s{2,}/g, " ").trim();
+  }
+
+  _tagsOf(raw) {
+    const rest = (raw || "").replace(QTY_RE, "");
+    const tags = new Set();
+    let m;
+    TAG_RE.lastIndex = 0;
+    while ((m = TAG_RE.exec(rest)) !== null) tags.add(m[1].toLowerCase());
+    return [...tags];
+  }
+
+  _catalogKey() { return `slpc-catalog:${this._config.entity}`; }
+
+  _loadCatalog() {
+    try {
+      const r = window.localStorage.getItem(this._catalogKey());
+      this._catalog = r ? JSON.parse(r) : {};
+    } catch (_) { this._catalog = {}; }
+  }
+
+  _saveCatalog() {
+    try { window.localStorage.setItem(this._catalogKey(), JSON.stringify(this._catalog)); } catch (_) {}
+  }
+
+  _catalogAdd(rawName) {
+    const name = this._cleanName(rawName);
+    if (!name) return;
+    const key = name.toLowerCase();
+    const prev = this._catalog[key] || { count: 0 };
+    this._catalog[key] = {
+      name,
+      tags: this._tagsOf(rawName),
+      count: (prev.count || 0) + 1,
+      last: Date.now(),
+    };
+    this._saveCatalog();
+  }
+
+  _catalogSeed() {
+    let changed = false;
+    for (const it of this._allParsed()) {
+      const key = it.name.toLowerCase();
+      if (!this._catalog[key]) {
+        this._catalog[key] = { name: it.name, tags: it.tags, count: 0, last: 0 };
+        changed = true;
+      }
+    }
+    if (changed) this._saveCatalog();
+  }
+
+  _computeSuggestions(text) {
+    const q = this._cleanName(text).toLowerCase();
+    if (q.length < 1) return [];
+    const out = [];
+    const seen = new Set();
+
+    // 1) Itens já na lista (por comprar) — selecionar incrementa a quantidade
+    for (const it of this._allParsed()) {
+      if (it.done) continue;
+      if (it.name.toLowerCase().includes(q)) {
+        out.push({ kind: "list", uid: it.uid, name: it.name, tags: it.tags, qty: it.qty, summary: it.summary });
+        seen.add(it.name.toLowerCase());
+      }
+    }
+
+    // 2) Histórico (catálogo) — selecionar adiciona
+    const cat = Object.values(this._catalog)
+      .filter((c) => c.name.toLowerCase().includes(q) && !seen.has(c.name.toLowerCase()))
+      .sort((a, b) => (b.count - a.count) || (b.last - a.last));
+    for (const c of cat) {
+      out.push({ kind: "catalog", name: c.name, tags: c.tags || [] });
+      seen.add(c.name.toLowerCase());
+    }
+
+    return out.slice(0, 6);
+  }
+
+  _activateSuggestion(i) {
+    const s = this._suggestions[i];
+    if (!s) return;
+    const addInput = this.shadowRoot.querySelector(".add-input");
+    const qtyInput = this.shadowRoot.querySelector(".qty-input");
+    if (s.kind === "list") {
+      this._setQty(s.uid, s.summary, (s.qty || 1) + 1);
+    } else {
+      const tagStr = s.tags.length ? " " + s.tags.map((t) => "#" + t).join(" ") : "";
+      this._addItem(s.name + tagStr, qtyInput ? qtyInput.value : 1);
+    }
+    if (addInput) addInput.value = "";
+    if (qtyInput) qtyInput.value = 1;
+    this._closeSuggestions();
+    if (addInput) addInput.focus();
+  }
+
+  _closeSuggestions() {
+    this._suggestions = [];
+    this._sugIndex = -1;
+    this._renderSuggestions();
+  }
+
   /* ---------------- Preferences (localStorage) ---------------- */
 
-  _prefsKey() {
-    return `slpc:${this._config.entity}`;
-  }
+  _prefsKey() { return `slpc:${this._config.entity}`; }
 
   _loadPrefs() {
     try {
@@ -238,32 +357,21 @@ class ShoppingListPlusCard extends HTMLElement {
 
   _buildChrome() {
     if (this._chromeBuilt) {
-      // title may have changed
       const t = this.shadowRoot.querySelector(".title");
       if (t) t.textContent = this._config.title;
       return;
     }
     this.shadowRoot.innerHTML = `
       <style>
-        :host {
-          --slpc-accent: var(--primary-color);
-          --slpc-radius: 12px;
-        }
+        :host { --slpc-accent: var(--primary-color); --slpc-radius: 12px; }
         ha-card { padding: 16px; }
-        .header {
-          display: flex; align-items: baseline; justify-content: space-between;
-          gap: 12px; margin-bottom: 14px;
-        }
-        .title {
-          font-size: 1.3rem; font-weight: 600; color: var(--primary-text-color);
-          letter-spacing: -0.01em;
-        }
+        .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+        .title { font-size: 1.3rem; font-weight: 600; color: var(--primary-text-color); letter-spacing: -0.01em; }
         .counts { font-size: 0.8rem; color: var(--secondary-text-color); white-space: nowrap; }
         .counts b { color: var(--slpc-accent); }
 
-        .add-row { display: flex; gap: 8px; margin-bottom: 10px; }
+        .add-row { display: flex; gap: 8px; }
         input.field {
-          flex: 1; min-width: 0;
           background: var(--secondary-background-color, rgba(127,127,127,0.1));
           border: 1px solid var(--divider-color, rgba(127,127,127,0.2));
           color: var(--primary-text-color);
@@ -271,28 +379,38 @@ class ShoppingListPlusCard extends HTMLElement {
           outline: none; transition: border-color 0.15s;
         }
         input.field:focus { border-color: var(--slpc-accent); }
+        .qty-input { flex: 0 0 56px; width: 56px; text-align: center; padding: 10px 6px; }
+        .add-input-wrap { flex: 1; min-width: 0; }
+        .add-input { width: 100%; box-sizing: border-box; }
         .add-btn {
           flex: 0 0 auto; border: none; cursor: pointer;
           background: var(--slpc-accent); color: var(--text-primary-color, #fff);
-          border-radius: var(--slpc-radius); padding: 0 16px; font-size: 1.3rem; line-height: 1;
-          font-weight: 500;
+          border-radius: var(--slpc-radius); padding: 0 16px; font-size: 1.3rem; line-height: 1; font-weight: 500;
         }
         .add-btn:active { transform: translateY(1px); }
 
+        .suggestions {
+          display: none; margin-top: 6px; margin-bottom: 4px; overflow: hidden;
+          border: 1px solid var(--divider-color, rgba(127,127,127,0.25));
+          border-radius: var(--slpc-radius);
+          background: var(--card-background-color, var(--ha-card-background, var(--primary-background-color)));
+        }
+        .sug { display: flex; align-items: center; gap: 8px; padding: 9px 12px; cursor: pointer; }
+        .sug:hover, .sug.hi { background: var(--secondary-background-color, rgba(127,127,127,0.12)); }
+        .sug-name { color: var(--primary-text-color); font-size: 0.92rem; }
+        .sug-meta { margin-left: auto; font-size: 0.7rem; color: var(--secondary-text-color); white-space: nowrap; }
+
+        .add-spacer { height: 10px; }
         .toolbar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
         .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
         .chip {
           cursor: pointer; user-select: none;
           border: 1px solid var(--divider-color, rgba(127,127,127,0.3));
           background: transparent; color: var(--secondary-text-color);
-          border-radius: 999px; padding: 4px 12px; font-size: 0.8rem;
-          transition: all 0.12s;
+          border-radius: 999px; padding: 4px 12px; font-size: 0.8rem; transition: all 0.12s;
         }
         .chip:hover { border-color: var(--slpc-accent); }
-        .chip.active {
-          background: var(--slpc-accent); border-color: var(--slpc-accent);
-          color: var(--text-primary-color, #fff);
-        }
+        .chip.active { background: var(--slpc-accent); border-color: var(--slpc-accent); color: var(--text-primary-color, #fff); }
         .toggle {
           cursor: pointer; user-select: none; font-size: 0.78rem;
           border: 1px solid var(--divider-color, rgba(127,127,127,0.3));
@@ -304,13 +422,9 @@ class ShoppingListPlusCard extends HTMLElement {
         .group-label {
           font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em;
           color: var(--secondary-text-color); margin: 14px 4px 6px;
-          border-bottom: 1px solid var(--divider-color, rgba(127,127,127,0.15));
-          padding-bottom: 4px;
+          border-bottom: 1px solid var(--divider-color, rgba(127,127,127,0.15)); padding-bottom: 4px;
         }
-        .row {
-          display: flex; align-items: center; gap: 12px;
-          padding: 9px 4px; border-radius: 8px;
-        }
+        .row { display: flex; align-items: center; gap: 10px; padding: 9px 4px; border-radius: 8px; }
         .row:hover { background: var(--secondary-background-color, rgba(127,127,127,0.07)); }
         .check {
           flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px; cursor: pointer;
@@ -327,18 +441,24 @@ class ShoppingListPlusCard extends HTMLElement {
           border: 1px solid var(--divider-color, rgba(127,127,127,0.25));
           border-radius: 999px; padding: 1px 8px; white-space: nowrap;
         }
+        .stepper { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+        .step {
+          cursor: pointer; border: 1px solid var(--divider-color, rgba(127,127,127,0.3));
+          background: transparent; color: var(--secondary-text-color);
+          border-radius: 6px; width: 24px; height: 24px; line-height: 1; font-size: 1rem; padding: 0;
+          transition: all 0.12s;
+        }
+        .step:hover { border-color: var(--slpc-accent); color: var(--slpc-accent); }
+        .qty { min-width: 18px; text-align: center; font-size: 0.9rem; color: var(--primary-text-color); }
+        .row.done .stepper, .row.done .qty { opacity: 0.55; }
         .del {
           flex: 0 0 auto; cursor: pointer; border: none; background: none;
-          color: var(--secondary-text-color); font-size: 1.1rem; opacity: 0;
-          padding: 2px 6px; transition: opacity 0.12s, color 0.12s;
+          color: var(--secondary-text-color); font-size: 1.1rem; opacity: 0; padding: 2px 6px;
+          transition: opacity 0.12s, color 0.12s;
         }
         .row:hover .del { opacity: 0.6; }
         .del:hover { color: var(--error-color, #db4437); opacity: 1; }
-
-        .empty, .msg {
-          text-align: center; color: var(--secondary-text-color);
-          padding: 28px 12px; font-size: 0.9rem;
-        }
+        .empty, .msg { text-align: center; color: var(--secondary-text-color); padding: 28px 12px; font-size: 0.9rem; }
       </style>
       <ha-card>
         <div class="header">
@@ -346,11 +466,16 @@ class ShoppingListPlusCard extends HTMLElement {
           <span class="counts"></span>
         </div>
         <div class="add-row">
-          <input class="field add-input" type="text"
-                 placeholder="Adicionar artigo…  (ex.: Leite #laticínios)" />
+          <input class="field qty-input" type="number" min="1" value="1" title="Quantidade" />
+          <div class="add-input-wrap">
+            <input class="field add-input" type="text" autocomplete="off"
+                   placeholder="Adicionar artigo…  (ex.: Leite #laticínios)" />
+          </div>
           <button class="add-btn" title="Adicionar">+</button>
         </div>
-        <input class="field search-input" type="text" placeholder="Procurar…" style="margin-bottom:10px;" />
+        <div class="suggestions"></div>
+        <div class="add-spacer"></div>
+        <input class="field search-input" type="text" placeholder="Procurar…" style="width:100%;box-sizing:border-box;margin-bottom:10px;" />
         <div class="toolbar">
           <button class="toggle t-group">Agrupar</button>
           <button class="toggle t-done">Concluídos</button>
@@ -364,16 +489,50 @@ class ShoppingListPlusCard extends HTMLElement {
     $(".title").textContent = this._config.title;
 
     const addInput = $(".add-input");
-    $(".add-btn").addEventListener("click", () => {
-      this._addItem(addInput.value);
+    const qtyInput = $(".qty-input");
+
+    const commitTyped = () => {
+      this._addItem(addInput.value, qtyInput.value);
       addInput.value = "";
+      qtyInput.value = 1;
+      this._closeSuggestions();
       addInput.focus();
+    };
+
+    $(".add-btn").addEventListener("click", commitTyped);
+
+    addInput.addEventListener("input", (e) => {
+      this._suggestions = this._computeSuggestions(e.target.value);
+      this._sugIndex = -1;
+      this._renderSuggestions();
     });
+
     addInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        this._addItem(addInput.value);
-        addInput.value = "";
+      const n = this._suggestions.length;
+      if (e.key === "ArrowDown" && n) {
+        e.preventDefault();
+        this._sugIndex = (this._sugIndex + 1) % n;
+        this._renderSuggestions();
+      } else if (e.key === "ArrowUp" && n) {
+        e.preventDefault();
+        this._sugIndex = (this._sugIndex - 1 + n) % n;
+        this._renderSuggestions();
+      } else if (e.key === "Enter") {
+        if (this._sugIndex >= 0) { e.preventDefault(); this._activateSuggestion(this._sugIndex); }
+        else commitTyped();
+      } else if (e.key === "Escape") {
+        this._closeSuggestions();
       }
+    });
+
+    addInput.addEventListener("blur", () => setTimeout(() => this._closeSuggestions(), 150));
+
+    $(".suggestions").addEventListener("mousedown", (e) => {
+      // mousedown (não click) para disparar antes do blur do input
+      const el = e.target.closest(".sug");
+      if (!el) return;
+      e.preventDefault();
+      this._activateSuggestion(parseInt(el.dataset.i, 10));
     });
 
     $(".search-input").addEventListener("input", (e) => {
@@ -398,19 +557,24 @@ class ShoppingListPlusCard extends HTMLElement {
       this._renderList();
     });
 
-    // Event delegation for list actions
     $(".list").addEventListener("click", (e) => {
       const el = e.target.closest("[data-action]");
       if (!el) return;
       const uid = el.dataset.uid;
-      if (el.dataset.action === "toggle") {
+      const action = el.dataset.action;
+      if (action === "toggle") {
         this._toggleItem(uid, el.dataset.status);
-      } else if (el.dataset.action === "delete") {
+      } else if (action === "delete") {
         this._removeItem(uid);
+      } else if (action === "inc" || action === "dec") {
+        const raw = this._items.find((x) => x.uid === uid);
+        if (!raw) return;
+        const p = this._parse(raw);
+        const nq = action === "inc" ? p.qty + 1 : Math.max(1, p.qty - 1);
+        if (nq !== p.qty) this._setQty(uid, raw.summary, nq);
       }
     });
 
-    // Chips delegation
     $(".chips").addEventListener("click", (e) => {
       const el = e.target.closest(".chip");
       if (!el) return;
@@ -435,10 +599,26 @@ class ShoppingListPlusCard extends HTMLElement {
 
   _renderCounts() {
     const parsed = this._allParsed();
-    const todo = parsed.filter((i) => !i.done).length;
+    const units = parsed.filter((i) => !i.done).reduce((n, i) => n + i.qty, 0);
+    const lines = parsed.filter((i) => !i.done).length;
     const done = parsed.filter((i) => i.done).length;
     const el = this.shadowRoot.querySelector(".counts");
-    el.innerHTML = `<b>${todo}</b> por comprar · ${done} no carrinho`;
+    el.innerHTML = `<b>${lines}</b> artigos · ${units} unid. · ${done} no carrinho`;
+  }
+
+  _renderSuggestions() {
+    const box = this.shadowRoot.querySelector(".suggestions");
+    const sugs = this._suggestions;
+    if (!sugs.length) { box.innerHTML = ""; box.style.display = "none"; return; }
+    box.style.display = "block";
+    box.innerHTML = sugs.map((s, i) => {
+      const badges = (s.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join("");
+      const meta = s.kind === "list"
+        ? `<span class="sug-meta">na lista · ×${s.qty} → +1</span>`
+        : `<span class="sug-meta">adicionar</span>`;
+      return `<div class="sug${i === this._sugIndex ? " hi" : ""}" data-i="${i}">
+        <span class="sug-name">${esc(s.name)}</span>${badges}${meta}</div>`;
+    }).join("");
   }
 
   _renderChips() {
@@ -463,16 +643,10 @@ class ShoppingListPlusCard extends HTMLElement {
       list.innerHTML = `<div class="msg">Erro ao ler a lista: ${esc(String(this._error.message || this._error))}</div>`;
       return;
     }
-    if (!this._loaded) {
-      list.innerHTML = `<div class="msg">A carregar…</div>`;
-      return;
-    }
+    if (!this._loaded) { list.innerHTML = `<div class="msg">A carregar…</div>`; return; }
 
     const visible = this._allParsed().filter((i) => this._matchesFilters(i));
-    if (visible.length === 0) {
-      list.innerHTML = `<div class="empty">Nada por aqui. 🛒</div>`;
-      return;
-    }
+    if (visible.length === 0) { list.innerHTML = `<div class="empty">Nada por aqui. 🛒</div>`; return; }
 
     if (this._groupByCategory) {
       list.innerHTML = this._renderGrouped(visible);
@@ -510,6 +684,11 @@ class ShoppingListPlusCard extends HTMLElement {
              data-uid="${esc(it.uid)}" data-status="${esc(it.status)}">${it.done ? "✓" : ""}</div>
         <div class="name">${esc(it.name)}</div>
         <div class="badges">${badges}</div>
+        <div class="stepper">
+          <button class="step" data-action="dec" data-uid="${esc(it.uid)}" title="Menos">−</button>
+          <span class="qty">${it.qty}</span>
+          <button class="step" data-action="inc" data-uid="${esc(it.uid)}" title="Mais">+</button>
+        </div>
         <button class="del" data-action="delete" data-uid="${esc(it.uid)}" title="Remover">×</button>
       </div>
     `;
@@ -528,11 +707,11 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "shopping-list-plus-card",
   name: "Shopping List Plus",
-  description: "Lista de compras com pesquisa, filtros por tag e agrupamento, em cima de uma entidade todo.",
+  description: "Lista de compras com sugestões, quantidades, filtros por tag e agrupamento, em cima de uma entidade todo.",
   preview: false,
   documentationURL: "https://developers.home-assistant.io/docs/frontend/custom-ui/custom-card",
 });
 
-console.info("%c SHOPPING-LIST-PLUS-CARD %c v1.0 ",
+console.info("%c SHOPPING-LIST-PLUS-CARD %c v1.1 ",
   "color:#fff;background:#d99a2b;border-radius:3px 0 0 3px;padding:2px 4px",
   "color:#d99a2b;background:#222;border-radius:0 3px 3px 0;padding:2px 4px");
