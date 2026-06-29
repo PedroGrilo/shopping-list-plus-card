@@ -1,4 +1,3 @@
-
 /**
  * Shopping List Plus Card  —  v1.2
  * Um custom card para o Home Assistant que assenta numa entidade `todo`
