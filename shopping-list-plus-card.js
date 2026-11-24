@@ -1,5 +1,5 @@
 /**
- * Shopping List Plus Card  —  v1.8.1
+ * Shopping List Plus Card  —  v1.8.2
  * Um custom card para o Home Assistant que assenta numa entidade `todo`
  * (ex.: todo.lista_de_compras) com pesquisa, filtros por categoria,
  * agrupamento, quantidades, recomendações e categorização automática.
@@ -30,7 +30,7 @@
  *                                 # ha-continente). Deteta-se sozinho; `continente: false` desliga.
  */
 
-const VERSION = "1.8.1";
+const VERSION = "1.8.2";
 const TAG_RE = /#([\p{L}\p{N}_-]+)/gu;               // só para limpar legado
 // prefixo de quantidade: "2x Ovos", "2 x ovos" ou "2 ovos" (sem "x" só se a seguir vier minúscula,
 // para não estragar nomes como "7 Up" ou "100 Montaditos")
@@ -299,7 +299,7 @@ class ShoppingListPlusCard extends HTMLElement {
       this._contState = st;
       this._contMap = null;
       const typing = this.shadowRoot.activeElement && this.shadowRoot.activeElement.classList.contains("cont-q");
-      if (this._loaded) { this._renderList(); this._renderCounts(); if (!typing) this._renderCont(); }
+      if (this._loaded) this._keepScroll(() => { this._renderListNow(); this._renderCounts(); if (!typing) this._renderCont(); });
     }
   }
 
@@ -922,7 +922,7 @@ class ShoppingListPlusCard extends HTMLElement {
       this._applyRemote(res && res.value);
       this._remoteLoaded = true;
       this._saveCatalog();
-      this._renderRecs();
+      this._keepScroll(() => this._renderRecs());
     } catch (e) {
       if (e && e.code === "unknown_command") this._remoteDisabled = true;   // HA sem suporte: fica só no browser
       else this._remoteRetryAt = Date.now() + 60000;                     // falha temporária: tenta mais tarde
@@ -1215,7 +1215,7 @@ class ShoppingListPlusCard extends HTMLElement {
     e.snooze = now + span;
     this._catalog[key] = e;
     this._saveCatalog();
-    this._renderRecs();
+    this._keepScroll(() => this._renderRecs());
   }
 
   /** Sugestões enquanto se escreve o nome: artigos da lista + histórico + dicionário. */
@@ -2162,10 +2162,45 @@ class ShoppingListPlusCard extends HTMLElement {
 
   _renderDynamic() {
     if (!this._chromeBuilt || !this._config) return;
-    this._renderChips();
-    this._renderList();
-    this._renderCounts();
-    this._renderRecs();
+    this._keepScroll(() => {
+      this._renderChips();
+      this._renderListNow();
+      this._renderCounts();
+      this._renderRecs();
+    });
+  }
+
+  _renderList() {
+    this._keepScroll(() => this._renderListNow());
+  }
+
+  /**
+   * Mantém no mesmo sítio do ecrã o primeiro artigo visível enquanto se redesenha.
+   * O Safari (iPhone) não tem "scroll anchoring": quando muda a altura do que está acima
+   * (sugestões, chips, botões) a lista saltava a meio das compras.
+   */
+  _keepScroll(render) {
+    if (this._keeping) { render(); return; }
+    const list = this._$(".list");
+    let uid = null;
+    let top = 0;
+    if (list && this.isConnected) {
+      const vh = window.innerHeight;
+      for (const r of list.querySelectorAll(".row")) {
+        if (r.classList.contains("pending") || r.classList.contains("removing") || r.classList.contains("dragging")) continue;
+        const b = r.getBoundingClientRect();
+        if (b.top >= vh) break;
+        if (b.top >= 0 && b.height) { uid = r.querySelector("[data-uid]")?.dataset.uid; top = b.top; break; }
+      }
+    }
+    this._keeping = true;
+    try { render(); } finally { this._keeping = false; }
+    if (!uid) return;
+    const ref = list.querySelector(`.row [data-uid="${CSS.escape(uid)}"]`);
+    const row = ref && ref.closest(".row");
+    if (!row) return;
+    const d = row.getBoundingClientRect().top - top;
+    if (Math.abs(d) >= 1) this._scrollParent().scrollBy(0, d);
   }
 
   _renderCounts() {
@@ -2267,7 +2302,7 @@ class ShoppingListPlusCard extends HTMLElement {
     box.innerHTML = parts.join("");
   }
 
-  _renderList() {
+  _renderListNow() {
     const list = this._$(".list");
     if (!list) return;
     // não destruir edição, toque longo ou arrasto em curso; volta a desenhar no fim
