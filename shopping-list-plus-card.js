@@ -1,5 +1,5 @@
 /**
- * Shopping List Plus Card  —  v1.8
+ * Shopping List Plus Card  —  v1.8.1
  * Um custom card para o Home Assistant que assenta numa entidade `todo`
  * (ex.: todo.lista_de_compras) com pesquisa, filtros por categoria,
  * agrupamento, quantidades, recomendações e categorização automática.
@@ -30,7 +30,7 @@
  *                                 # ha-continente). Deteta-se sozinho; `continente: false` desliga.
  */
 
-const VERSION = "1.8";
+const VERSION = "1.8.1";
 const TAG_RE = /#([\p{L}\p{N}_-]+)/gu;               // só para limpar legado
 // prefixo de quantidade: "2x Ovos", "2 x ovos" ou "2 ovos" (sem "x" só se a seguir vier minúscula,
 // para não estragar nomes como "7 Up" ou "100 Montaditos")
@@ -1281,9 +1281,10 @@ class ShoppingListPlusCard extends HTMLElement {
       ha-card { display: block; padding: 16px; position: relative; overflow: visible; container-type: inline-size; }
       button { font-family: inherit; }
       button:focus-visible { outline: 2px solid var(--slpc-accent); outline-offset: 2px; }
-      .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+      .header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; column-gap: 12px; row-gap: 2px; margin-bottom: 14px; }
       .title { font-size: 1.3rem; font-weight: 600; color: var(--primary-text-color); letter-spacing: -0.01em; }
-      .counts { font-size: 0.8rem; color: var(--secondary-text-color); white-space: nowrap; }
+      .counts { font-size: 0.8rem; color: var(--secondary-text-color); min-width: 0; margin-left: auto; text-align: right; }
+      .counts .seg { white-space: nowrap; }
       .counts b { color: var(--slpc-accent); }
       .live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-left: 6px; vertical-align: middle; background: var(--warning-color, #ffa600); }
 
@@ -2176,7 +2177,12 @@ class ShoppingListPlusCard extends HTMLElement {
     if (!this._loaded) { el.textContent = ""; return; }
     const dot = this._live ? "" : `<span class="live-dot" title="Sem atualização em tempo real — a atualizar periodicamente"></span>`;
     const est = this._contTotal();
-    el.innerHTML = `<b>${pending.length}</b> por comprar${units !== pending.length ? ` · ${units} unid.` : ""}${est != null ? ` · ≈ <b>${fmtEur(est)}</b>` : ""}${done ? ` · ${done} comprado${done > 1 ? "s" : ""}` : ""}${dot}`;
+    // cada parte fica inteira; em ecrãs estreitos o contador parte entre partes em vez de transbordar
+    const segs = [`<b>${pending.length}</b> por comprar`];
+    if (units !== pending.length) segs.push(`${units} unid.`);
+    if (est != null) segs.push(`≈ <b>${fmtEur(est)}</b>`);
+    if (done) segs.push(`${done} comprado${done > 1 ? "s" : ""}`);
+    el.innerHTML = segs.map((s, i) => `<span class="seg">${i ? "· " : ""}${s}${i === segs.length - 1 ? dot : ""}</span>`).join(" ");
     const tc = this._$(".t-cont");
     if (tc) { tc.hidden = !this._contSensor(); tc.classList.toggle("active", !!(this._contMode && this._contMode.type === "send")); }
     const autoCat = this._$(".auto-cat");
