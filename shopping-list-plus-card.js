@@ -1,5 +1,5 @@
 /**
- * Shopping List Plus Card  —  v1.4
+ * Shopping List Plus Card  —  v1.5
  * Um custom card para o Home Assistant que assenta numa entidade `todo`
  * (ex.: todo.lista_de_compras) com pesquisa, filtros por categoria,
  * agrupamento, quantidades, recomendações e categorização automática.
@@ -27,7 +27,7 @@
  *   auto_category: true           # opcional, adivinha a categoria pelo nome
  */
 
-const VERSION = "1.4";
+const VERSION = "1.5";
 const TAG_RE = /#([\p{L}\p{N}_-]+)/gu;               // só para limpar legado
 // prefixo de quantidade: "2x Ovos", "2 x ovos" ou "2 ovos" (sem "x" só se a seguir vier minúscula,
 // para não estragar nomes como "7 Up" ou "100 Montaditos")
@@ -40,11 +40,16 @@ const DAY = 86400000;
 const SESSION_GAP = 3 * 3600000;                      // compras com < 3h de distância = mesma ida às compras
 const HISTORY_LEN = 12;
 
-/** minúsculas, sem acentos, espaços normalizados */
+/** minúsculas, sem acentos, espaços normalizados (com cache: é chamada milhares de vezes por render) */
+const NORM_CACHE = new Map();
 function norm(s) {
-  return String(s || "")
-    .normalize("NFD").replace(/[̀-ͯ]/g, "")
-    .toLowerCase().replace(/\s+/g, " ").trim();
+  const k = String(s || "");
+  let v = NORM_CACHE.get(k);
+  if (v !== undefined) return v;
+  v = k.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (NORM_CACHE.size > 5000) NORM_CACHE.clear();
+  NORM_CACHE.set(k, v);
+  return v;
 }
 
 function esc(s) {
@@ -202,8 +207,44 @@ class ShoppingListPlusCard extends HTMLElement {
 
   /* ---------------- Lovelace lifecycle ---------------- */
 
-  static getStubConfig() {
-    return { entity: "todo.lista_de_compras", title: "Compras" };
+  static getStubConfig(hass) {
+    const ids = Object.keys((hass && hass.states) || {}).filter((id) => id.startsWith("todo."));
+    const entity = ids.find((id) => /compra|shopping/i.test(id)) || ids[0] || "todo.lista_de_compras";
+    return { entity, title: "Compras" };
+  }
+
+  /** Editor visual no HA (2024.11+): sem YAML para as opções básicas. */
+  static getConfigForm() {
+    const labels = {
+      entity: "Lista (entidade todo)",
+      title: "Título",
+      accent_color: "Cor de destaque (opcional, ex.: #d99a2b)",
+      group_by_category: "Agrupar por categoria",
+      show_completed: "Mostrar comprados",
+      auto_category: "Categoria automática",
+      recommendations: "Nº de sugestões (0 = desligar)",
+    };
+    return {
+      schema: [
+        { name: "entity", required: true, selector: { entity: { domain: "todo" } } },
+        { name: "title", selector: { text: {} } },
+        { name: "accent_color", selector: { text: {} } },
+        {
+          name: "", type: "grid", schema: [
+            { name: "group_by_category", selector: { boolean: {} } },
+            { name: "show_completed", selector: { boolean: {} } },
+            { name: "auto_category", selector: { boolean: {} } },
+            { name: "recommendations", selector: { number: { min: 0, max: 20, mode: "box" } } },
+          ],
+        },
+      ],
+      computeLabel: (s) => labels[s.name],
+    };
+  }
+
+  /** Layout de secções: ocupa a largura toda por omissão, mínimo meia coluna. */
+  getGridOptions() {
+    return { columns: 12, min_columns: 6, min_rows: 4 };
   }
 
   setConfig(config) {
@@ -523,11 +564,19 @@ class ShoppingListPlusCard extends HTMLElement {
     return this._callService("update_item", data);
   }
 
-  _toggleItem(uid) {
+  _toggleItem(uid, btn) {
     const raw = this._findRaw(uid);   // usa o estado atual, não o do último render
     if (!raw) return;
     const done = raw.status === "completed";
-    this._callService("update_item", { item: uid, status: done ? "needs_action" : "completed" });
+    // resposta visual imediata; o render seguinte (confirmação ou erro do HA) acerta o estado
+    const row = btn && btn.closest(".row");
+    if (row) {
+      row.classList.toggle("done", !done);
+      btn.classList.toggle("done", !done);
+      btn.textContent = done ? "" : "✓";
+      row.classList.add("pending");
+    }
+    this._callService("update_item", { item: uid, status: done ? "needs_action" : "completed" }).catch(() => this._renderList());
   }
 
   _setQty(uid, qty) {
@@ -536,24 +585,23 @@ class ShoppingListPlusCard extends HTMLElement {
     this._updateItem({ uid }, { qty });
   }
 
-  _removeItem(uid) {
+  _removeItem(uid, btn) {
     const raw = this._findRaw(uid);
     if (!raw) return;
     const snapshot = { ...raw };
-    this._callService("remove_item", { item: uid });
+    const row = btn && btn.closest(".row");
+    if (row) row.classList.add("removing");
+    this._callService("remove_item", { item: uid }).catch(() => this._renderList());
     const p = this._parse(raw);
-    this._toast(`“${p.name}” removido`, "Desfazer", () => {
-      const data = { item: snapshot.summary };
-      if (snapshot.description) data.description = snapshot.description;
-      this._restoreAdd(snapshot);
-    });
+    this._toast(`“${p.name}” removido`, "Desfazer", () => this._restoreAdd(snapshot));
   }
 
   _clearCompleted() {
     const done = this._items.filter((i) => i.status === "completed");
     if (!done.length) return;
     const snapshots = done.map((i) => ({ ...i }));
-    this._callService("remove_item", { item: done.map((i) => i.uid) });
+    this._$(".list").querySelectorAll(".row.done").forEach((r) => r.classList.add("removing"));
+    this._callService("remove_item", { item: done.map((i) => i.uid) }).catch(() => this._renderList());
     this._toast(`${done.length} comprado${done.length > 1 ? "s" : ""} removido${done.length > 1 ? "s" : ""}`, "Desfazer", async () => {
       for (const s of snapshots) await this._restoreAdd(s);
     });
@@ -698,7 +746,18 @@ class ShoppingListPlusCard extends HTMLElement {
     }
   }
 
+  /** Invalida as caches que dependem do catálogo/categorias. */
+  _bumpCats() { this._catsVer = (this._catsVer || 0) + 1; }
+
   _knownCats() {
+    const c = this._knownCache;
+    if (c && c.items === this._items && c.ver === this._catsVer) return c.list;
+    const list = this._computeKnownCats();
+    this._knownCache = { items: this._items, ver: this._catsVer, list };
+    return list;
+  }
+
+  _computeKnownCats() {
     const map = new Map(); // norm -> display
     const add = (c) => {
       const n = (c || "").trim();
@@ -768,6 +827,7 @@ class ShoppingListPlusCard extends HTMLElement {
   }
 
   _saveCatalog() {
+    this._bumpCats();
     this._pruneCatalog();
     try { window.localStorage.setItem(this._catalogKey(), JSON.stringify(this._catalog)); } catch (_) {}
     this._scheduleRemoteSave();
@@ -779,15 +839,18 @@ class ShoppingListPlusCard extends HTMLElement {
       const a = r ? JSON.parse(r) : [];
       this._cats = new Set(Array.isArray(a) ? a.filter((x) => typeof x === "string") : []);
     } catch (_) { this._cats = new Set(); }
+    this._bumpCats();
   }
 
   _saveCats() {
+    this._bumpCats();
     try { window.localStorage.setItem(this._catsKey(), JSON.stringify([...this._cats])); } catch (_) {}
     this._scheduleRemoteSave();
   }
 
   /** Junta entradas (locais antigas, remotas) sem perder histórico. Chaves sempre normalizadas. */
   _mergeCatalog(src) {
+    this._bumpCats();
     for (const [k, v] of Object.entries(src || {})) {
       if (!v || typeof v !== "object" || typeof v.name !== "string") continue;
       const key = norm(splitQty(v.name).name) || norm(k);
@@ -823,7 +886,7 @@ class ShoppingListPlusCard extends HTMLElement {
     const all = Object.keys(this._catalog);
     if (all.length <= 400) return;
     const now = Date.now();
-    const keep = new Set(this._allParsed().map((i) => norm(i.name)));
+    const keep = new Set(this._allParsed().map((i) => norm(i.effName)));
     const keys = all.filter((k) => !keep.has(k) && !(this._catalog[k].snooze > now));
     const act = (e) => Math.max(e.last || 0, e.snooze || 0);
     keys.sort((a, b) => (this._catalog[a].count - this._catalog[b].count) || (act(this._catalog[a]) - act(this._catalog[b])));
@@ -1048,6 +1111,7 @@ class ShoppingListPlusCard extends HTMLElement {
   /** Garante que tudo o que está na lista existe no catálogo (sem contar como compra). */
   _learnFromList() {
     let changed = false;
+    let catsChanged = false;
     for (const it of this._allParsed()) {
       const name = it.effName;   // "Dois ovos." -> "ovos"
       const key = norm(name);
@@ -1061,8 +1125,9 @@ class ShoppingListPlusCard extends HTMLElement {
         if (!e.count) e.name = name;
         changed = true;
       }
-      if (it.category && ![...this._cats].some((c) => norm(c) === it.catKey)) { this._cats.add(it.category); this._saveCats(); }
+      if (it.category && ![...this._cats].some((c) => norm(c) === it.catKey)) { this._cats.add(it.category); catsChanged = true; }
     }
+    if (catsChanged) this._saveCats();
     if (changed) this._saveCatalog();
   }
 
@@ -1077,7 +1142,7 @@ class ShoppingListPlusCard extends HTMLElement {
   _computeRecs(limit) {
     const now = Date.now();
     const parsed = this._allParsed();
-    const pending = new Set(parsed.filter((i) => !i.done).map((i) => norm(i.name)));
+    const pending = new Set(parsed.filter((i) => !i.done).map((i) => norm(i.effName)));
     const out = [];
     for (const [key, e] of Object.entries(this._catalog)) {
       if (pending.has(key) || !e.count || (e.snooze && e.snooze > now)) continue;
@@ -1198,6 +1263,7 @@ class ShoppingListPlusCard extends HTMLElement {
       :host { --slpc-accent: var(--primary-color); --slpc-radius: 12px; display: block; }
       ha-card { padding: 16px; position: relative; overflow: visible; container-type: inline-size; }
       button { font-family: inherit; }
+      button:focus-visible { outline: 2px solid var(--slpc-accent); outline-offset: 2px; }
       .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
       .title { font-size: 1.3rem; font-weight: 600; color: var(--primary-text-color); letter-spacing: -0.01em; }
       .counts { font-size: 0.8rem; color: var(--secondary-text-color); white-space: nowrap; }
@@ -1253,9 +1319,11 @@ class ShoppingListPlusCard extends HTMLElement {
       .rec {
         display: inline-flex; align-items: center; flex: 0 0 auto; gap: 2px;
         border: 1px dashed var(--slpc-accent); border-radius: 999px; background: transparent;
-        color: var(--primary-text-color); font-size: 0.85rem; cursor: pointer; padding: 0 4px 0 10px; min-height: 32px;
+        color: var(--primary-text-color); font-size: 0.85rem; padding: 0 4px 0 0; min-height: 32px;
       }
       .rec:hover { background: color-mix(in srgb, var(--slpc-accent) 14%, transparent); }
+      .rec.pending { opacity: 0.5; }
+      .rec-add { border: none; background: none; color: inherit; font: inherit; cursor: pointer; padding: 6px 2px 6px 10px; display: inline-flex; align-items: center; }
       .rec .plus { color: var(--slpc-accent); font-weight: 700; margin-right: 2px; }
       .rec .x { border: none; background: none; color: var(--secondary-text-color); cursor: pointer; font-size: 0.95rem; padding: 4px 6px; border-radius: 50%; }
       .rec .x:hover { color: var(--error-color, #db4437); }
@@ -1328,6 +1396,8 @@ class ShoppingListPlusCard extends HTMLElement {
       .step:hover { border-color: var(--slpc-accent); color: var(--slpc-accent); }
       .qty { min-width: 22px; text-align: center; font-size: 0.9rem; color: var(--primary-text-color); }
       .row.done .stepper { display: none; }
+      .row.pending { opacity: 0.7; }
+      .row.removing { opacity: 0; height: 0; min-height: 0; padding: 0; overflow: hidden; transition: opacity 0.15s; }
       .del {
         flex: 0 0 auto; cursor: pointer; border: none; background: none;
         color: var(--secondary-text-color); font-size: 1.15rem; opacity: 0.35; padding: 4px 8px; border-radius: 6px;
@@ -1555,7 +1625,10 @@ class ShoppingListPlusCard extends HTMLElement {
       if (x) { e.stopPropagation(); this._snooze(rec.dataset.key); return; }
       const r = (this._recs || []).find((o) => o.key === rec.dataset.key);
       if (!r) return;
-      rec.disabled = true;
+      const addBtn = rec.querySelector(".rec-add");
+      if (!e.target.closest(".rec-add") || addBtn.disabled) return;
+      addBtn.disabled = true;
+      rec.classList.add("pending");
       this._addItem(r.name, 1, r.category).then((name) => name && this._revealIfHidden(name)).catch(() => {});
     });
   }
@@ -1620,8 +1693,8 @@ class ShoppingListPlusCard extends HTMLElement {
       if (!el) return;
       const uid = el.dataset.uid;
       const action = el.dataset.action;
-      if (action === "toggle") this._toggleItem(uid);
-      else if (action === "delete") this._removeItem(uid);
+      if (action === "toggle") this._toggleItem(uid, el);
+      else if (action === "delete") this._removeItem(uid, el);
       else if (action === "edit") this._startEdit(uid, el);
       else if (action === "retry") this._resubscribe();
       else if (action === "inc" || action === "dec") this._bumpQty(uid, action === "inc" ? 1 : -1, el);
@@ -1639,7 +1712,7 @@ class ShoppingListPlusCard extends HTMLElement {
       if (!raw) return;
       const p = this._parse(raw);
       if (cat) this._addCat(cat);
-      const key = norm(p.name);
+      const key = norm(p.effName);
       if (this._catalog[key]) { this._catalog[key].category = cat; this._saveCatalog(); }
       this._updateItem({ uid }, { category: cat }).catch(() => {});
     });
@@ -1801,9 +1874,10 @@ class ShoppingListPlusCard extends HTMLElement {
     this._recs = this._computeRecs(limit);
     box.hidden = !this._recs.length;
     this._$(".recs-row").innerHTML = this._recs.map((r) => `
-      <button class="rec" type="button" data-key="${esc(r.key)}" title="${esc(r.reason)}${r.category ? " · " + esc(r.category) : ""}">
-        <span class="plus">+</span>${esc(r.name)}<span class="x" role="button" aria-label="Agora não" title="Agora não">×</span>
-      </button>`).join("");
+      <span class="rec" data-key="${esc(r.key)}">
+        <button class="rec-add" type="button" title="${esc(r.reason)}${r.category ? " · " + esc(r.category) : ""}" aria-label="Adicionar ${esc(r.name)}"><span class="plus">+</span>${esc(r.name)}</button>
+        <button class="x" type="button" aria-label="Agora não: ${esc(r.name)}" title="Agora não">×</button>
+      </span>`).join("");
   }
 
   _renderSuggestions() {
@@ -1851,7 +1925,9 @@ class ShoppingListPlusCard extends HTMLElement {
       if (pruned) this._savePrefs();
     }
     if (cats.length + (hasUncat ? 1 : 0) < 2 && this._activeCats.size === 0) { box.innerHTML = ""; return; }
-    const count = (k) => parsed.filter((i) => (k === UNCAT ? !i.category : i.catKey === k) && !i.done).length;
+    const counts = new Map();
+    for (const i of parsed) if (!i.done) { const k = i.category ? i.catKey : UNCAT; counts.set(k, (counts.get(k) || 0) + 1); }
+    const count = (k) => counts.get(k) || 0;
     const parts = cats.map(([k, label]) => {
       const active = this._activeCats.has(k) ? " active" : "";
       return `<button class="chip${active}" type="button" data-cat="${esc(k)}">${esc(label)}<span class="n">${count(k)}</span></button>`;
@@ -1879,7 +1955,8 @@ class ShoppingListPlusCard extends HTMLElement {
 
     const all = this._allParsed();
     const visible = all.filter((i) => this._matchesFilters(i));
-    const hidden = all.filter((i) => !i.done && !visible.includes(i)).length;
+    const visibleSet = new Set(visible);
+    const hidden = all.filter((i) => !i.done && !visibleSet.has(i)).length;
     const hiddenDone = !this._showCompleted ? all.filter((i) => i.done).length : 0;
     if (hidden > 0) {
       this._$(".banner-msg").textContent =
@@ -1896,7 +1973,7 @@ class ShoppingListPlusCard extends HTMLElement {
       return;
     }
 
-    this._rowCats = this._knownCats();
+    this._rowCats = this._knownCats().map((c) => [c, norm(c), esc(c)]);
     const pending = visible.filter((i) => !i.done);
     const done = visible.filter((i) => i.done);
     let html = this._groupByCategory ? this._renderGrouped(pending) : pending.map((i) => this._rowHtml(i)).join("");
@@ -1927,11 +2004,12 @@ class ShoppingListPlusCard extends HTMLElement {
   }
 
   _catSelectHtml(it) {
-    const cats = [...(this._rowCats || this._knownCats())];
-    if (it.category && !cats.some((c) => norm(c) === it.catKey)) cats.push(it.category);
+    const cats = this._rowCats || this._knownCats().map((c) => [c, norm(c), esc(c)]);
+    const extra = it.category && !cats.some(([, k]) => k === it.catKey)
+      ? `<option value="${esc(it.category)}" selected>${esc(it.category)}</option>` : "";
     const opts = [`<option value=""${it.category ? "" : " selected"}>Sem categoria</option>`]
-      .concat(cats.map((c) => `<option value="${esc(c)}"${norm(c) === it.catKey ? " selected" : ""}>${esc(c)}</option>`))
-      .concat([`<option value="__new__">+ Nova categoria…</option>`]);
+      .concat(cats.map(([, k, e]) => `<option value="${e}"${k === it.catKey ? " selected" : ""}>${e}</option>`))
+      .concat([extra, `<option value="__new__">+ Nova categoria…</option>`]);
     return `<label class="badge-wrap" title="Mudar categoria">
       <span class="badge${it.category ? "" : " none"}">${it.category ? esc(it.category) : "+ categoria"}</span>
       <select class="badge-select" data-uid="${esc(it.uid)}" aria-label="Categoria de ${esc(it.name)}">${opts.join("")}</select>
@@ -1966,7 +2044,7 @@ if (!customElements.get("shopping-list-plus-card")) {
     name: "Shopping List Plus",
     description: "Lista de compras com recomendações, categorias automáticas, quantidades e filtros, em cima de uma entidade todo.",
     preview: false,
-    documentationURL: "https://developers.home-assistant.io/docs/frontend/custom-ui/custom-card",
+    documentationURL: "https://github.com/PedroGrilo/shopping-list-plus-card",
   });
   console.info(`%c SHOPPING-LIST-PLUS-CARD %c v${VERSION} `,
     "color:#fff;background:#7B8CFF;border-radius:3px 0 0 3px;padding:2px 4px",

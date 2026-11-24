@@ -38,6 +38,9 @@ no backend integration required. The UI is in Portuguese.
   towards the recommendations. Quantities in words are understood everywhere
   (`dois`, `três`, `meia dúzia de`, `uma dúzia de`…).
 - **Categorizar (N)** button: guesses a category for items that have none.
+- Ticking or deleting an item updates the list straight away, without
+  waiting for Home Assistant to reply. If Home Assistant returns an error,
+  the list goes back to how it was.
 
 ## Adding with Siri
 
@@ -65,6 +68,11 @@ In storage mode, HACS registers the resource automatically as
 In YAML mode, add it manually under `resources` with `type: module`.
 
 ## Configuration
+
+The card has a visual editor (Home Assistant 2024.11+): add it from the card
+picker and choose the `todo` list. When added from the picker it picks a
+`todo` entity automatically (one with "compras"/"shopping" in its name if
+there is one). It also works in the Sections layout. YAML still works:
 
 ```yaml
 type: custom:shopping-list-plus-card
