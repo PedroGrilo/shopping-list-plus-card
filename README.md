@@ -94,8 +94,20 @@ auto_category: true       # optional
 | `show_completed` | no | `true` | Show bought (completed) items |
 | `recommendations` | no | `8` | How many recommendations to show (`0` hides them) |
 | `auto_category` | no | `true` | Guess the category from the item name |
+| `continente` | no | auto | Price sensor from [ha-continente](https://github.com/PedroGrilo/ha-continente); found automatically, `false` turns it off |
 
 Group/filter/show-bought choices made on the card are remembered per browser.
+
+## Continente prices and basket
+
+With the [ha-continente](https://github.com/PedroGrilo/ha-continente) integration installed,
+the card finds its price sensor by itself and:
+
+- shows the Continente price next to each item to buy, and the estimated total in the header;
+- tapping a price opens the product chosen for that item, its alternatives and a catalog
+  search; the product you pick is remembered for that item name;
+- the **🛒 Continente** button lists what will go to the basket and **Adicionar ao carrinho**
+  adds it to the Continente basket (the same one as the app). It never places an order.
 
 ## Data model
 

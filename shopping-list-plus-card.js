@@ -1,5 +1,5 @@
 /**
- * Shopping List Plus Card  —  v1.5
+ * Shopping List Plus Card  —  v1.6
  * Um custom card para o Home Assistant que assenta numa entidade `todo`
  * (ex.: todo.lista_de_compras) com pesquisa, filtros por categoria,
  * agrupamento, quantidades, recomendações e categorização automática.
@@ -25,9 +25,12 @@
  *   show_completed: true          # opcional
  *   recommendations: 8            # opcional, nº de recomendações (0 = desligar)
  *   auto_category: true           # opcional, adivinha a categoria pelo nome
+ *   continente: sensor.continente_estimativa_da_lista_de_compras
+ *                                 # opcional: preços e "Enviar para o Continente" (integração
+ *                                 # ha-continente). Deteta-se sozinho; `continente: false` desliga.
  */
 
-const VERSION = "1.5";
+const VERSION = "1.6";
 const TAG_RE = /#([\p{L}\p{N}_-]+)/gu;               // só para limpar legado
 // prefixo de quantidade: "2x Ovos", "2 x ovos" ou "2 ovos" (sem "x" só se a seguir vier minúscula,
 // para não estragar nomes como "7 Up" ou "100 Montaditos")
@@ -39,6 +42,8 @@ const UNCAT = "__uncat__";
 const DAY = 86400000;
 const SESSION_GAP = 3 * 3600000;                      // compras com < 3h de distância = mesma ida às compras
 const HISTORY_LEN = 12;
+const EUR = new Intl.NumberFormat("pt-PT", { style: "currency", currency: "EUR" });
+const fmtEur = (v) => (v == null || isNaN(v) ? "" : EUR.format(v));
 
 /** minúsculas, sem acentos, espaços normalizados (com cache: é chamada milhares de vezes por render) */
 const NORM_CACHE = new Map();
@@ -223,12 +228,14 @@ class ShoppingListPlusCard extends HTMLElement {
       show_completed: "Mostrar comprados",
       auto_category: "Categoria automática",
       recommendations: "Nº de sugestões (0 = desligar)",
+      continente: "Continente: sensor de preços (opcional, deteta-se sozinho)",
     };
     return {
       schema: [
         { name: "entity", required: true, selector: { entity: { domain: "todo" } } },
         { name: "title", selector: { text: {} } },
         { name: "accent_color", selector: { text: {} } },
+        { name: "continente", selector: { entity: { domain: "sensor", integration: "continente" } } },
         {
           name: "", type: "grid", schema: [
             { name: "group_by_category", selector: { boolean: {} } },
@@ -285,6 +292,15 @@ class ShoppingListPlusCard extends HTMLElement {
     this._ensureSubscribed();
     this._checkHealth();
     if (!this._remoteLoaded) this._loadRemoteCatalog();
+    // Preços do Continente: só volta a desenhar quando o sensor muda
+    const cs = this._contSensor();
+    const st = cs ? hass.states[cs] : null;
+    if (st !== this._contState) {
+      this._contState = st;
+      this._contMap = null;
+      const typing = this.shadowRoot.activeElement && this.shadowRoot.activeElement.classList.contains("cont-q");
+      if (this._loaded) { this._renderList(); this._renderCounts(); if (!typing) this._renderCont(); }
+    }
   }
 
   connectedCallback() {
@@ -1362,6 +1378,50 @@ class ShoppingListPlusCard extends HTMLElement {
         border-bottom: 1px solid var(--divider-color, rgba(127,127,127,0.15)); padding-bottom: 4px;
       }
       .done-label { margin-top: 18px; }
+      .price {
+        flex: 0 0 auto; border: 1px solid var(--divider-color, rgba(127,127,127,0.25)); background: transparent;
+        color: var(--secondary-text-color); border-radius: 999px; padding: 2px 8px; font-size: 0.78rem;
+        cursor: pointer; font-variant-numeric: tabular-nums; white-space: nowrap;
+      }
+      .price:hover { border-color: var(--slpc-accent); color: var(--slpc-accent); }
+      .price.chosen { border-color: color-mix(in srgb, var(--slpc-accent) 55%, transparent); }
+      .price.off { text-decoration: line-through; opacity: 0.7; }
+      .price.missing, .price.pending { border-style: dashed; }
+      .cont-panel {
+        border: 1px solid var(--divider-color, rgba(127,127,127,0.25)); border-radius: var(--slpc-radius);
+        padding: 12px; margin: 4px 0 12px; display: flex; flex-direction: column; gap: 6px;
+      }
+      .cont-panel.busy { opacity: 0.6; pointer-events: none; }
+      .cont-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--primary-text-color); }
+      .cont-x { border: none; background: none; color: var(--secondary-text-color); font-size: 1.3rem; cursor: pointer; line-height: 1; padding: 4px 8px; }
+      .cont-sub { font-size: 0.78rem; color: var(--secondary-text-color); }
+      .cont-sub a { color: var(--slpc-accent); }
+      .cont-ok { color: var(--success-color, #2e7d32); font-weight: 600; }
+      .cont-prod {
+        display: flex; justify-content: space-between; gap: 10px; text-align: left; width: 100%;
+        border: 1px solid var(--divider-color, rgba(127,127,127,0.25)); background: transparent; color: var(--primary-text-color);
+        border-radius: 8px; padding: 8px 10px; font-size: 0.88rem; cursor: pointer;
+      }
+      .cont-prod:hover { border-color: var(--slpc-accent); }
+      .cont-prod.current { border-color: var(--slpc-accent); background: color-mix(in srgb, var(--slpc-accent) 10%, transparent); cursor: default; }
+      .cont-prod.off { opacity: 0.6; }
+      .cp-price, .cl-price { font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .cont-search { display: flex; gap: 6px; margin-top: 4px; }
+      .cont-search .field { flex: 1 1 auto; padding: 8px 12px; }
+      .cont-foot { display: flex; gap: 6px; flex-wrap: wrap; }
+      .cont-lines { display: flex; flex-direction: column; max-height: 50vh; overflow-y: auto; }
+      .cont-line {
+        display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 2px 8px; align-items: center;
+        padding: 6px 0; border-bottom: 1px solid var(--divider-color, rgba(127,127,127,0.15)); font-size: 0.88rem;
+      }
+      .cl-item { color: var(--primary-text-color); }
+      .cl-prod { grid-column: 1; font-size: 0.75rem; color: var(--secondary-text-color); }
+      .cl-price { grid-row: 1; grid-column: 2; }
+      .cl-swap { grid-row: 1 / span 2; grid-column: 3; border: none; background: none; color: var(--slpc-accent); cursor: pointer; font-size: 0.8rem; padding: 4px; }
+      .cont-line.missing .cl-prod, .cont-line.off .cl-prod { color: var(--warning-color, #b26a00); }
+      .cont-total { display: flex; justify-content: space-between; padding-top: 4px; color: var(--primary-text-color); }
+      .cont-send { align-self: stretch; }
+      .cont-send[disabled] { opacity: 0.5; cursor: default; }
       .row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: 8px; min-height: 40px; }
       .row:hover { background: var(--secondary-background-color, rgba(127,127,127,0.07)); }
       .check {
@@ -1466,7 +1526,9 @@ class ShoppingListPlusCard extends HTMLElement {
           <button class="toggle t-done" type="button">Mostrar comprados</button>
           <button class="toggle auto-cat" type="button" hidden title="Adivinhar a categoria dos artigos sem categoria"></button>
           <button class="toggle clear-done" type="button" hidden>Limpar comprados</button>
+          <button class="toggle t-cont" type="button" hidden>🛒 Continente</button>
         </div>
+        <div class="cont-panel" hidden></div>
         <div class="chips"></div>
         <div class="banner"><span class="banner-msg"></span><button class="banner-btn" type="button">Mostrar tudo</button></div>
         <div class="list"></div>
@@ -1662,6 +1724,8 @@ class ShoppingListPlusCard extends HTMLElement {
       this._renderDynamic();
     });
     this._$(".clear-done").addEventListener("click", () => this._clearCompleted());
+    this._$(".t-cont").addEventListener("click", () => this._openCont(this._contMode && this._contMode.type === "send" ? null : { type: "send" }));
+    this._wireCont();
     this._$(".auto-cat").addEventListener("click", () => this._autoCategorizeAll());
     this._$(".banner-btn").addEventListener("click", () => {
       this._revealAll();
@@ -1697,6 +1761,7 @@ class ShoppingListPlusCard extends HTMLElement {
       else if (action === "delete") this._removeItem(uid, el);
       else if (action === "edit") this._startEdit(uid, el);
       else if (action === "retry") this._resubscribe();
+      else if (action === "price") this._openCont({ type: "pick", uid });
       else if (action === "inc" || action === "dec") this._bumpQty(uid, action === "inc" ? 1 : -1, el);
     });
     list.addEventListener("change", (e) => {
@@ -1856,7 +1921,10 @@ class ShoppingListPlusCard extends HTMLElement {
     const el = this._$(".counts");
     if (!this._loaded) { el.textContent = ""; return; }
     const dot = this._live ? "" : `<span class="live-dot" title="Sem atualização em tempo real — a atualizar periodicamente"></span>`;
-    el.innerHTML = `<b>${pending.length}</b> por comprar${units !== pending.length ? ` · ${units} unid.` : ""}${done ? ` · ${done} comprado${done > 1 ? "s" : ""}` : ""}${dot}`;
+    const est = this._contTotal();
+    el.innerHTML = `<b>${pending.length}</b> por comprar${units !== pending.length ? ` · ${units} unid.` : ""}${est != null ? ` · ≈ <b>${fmtEur(est)}</b>` : ""}${done ? ` · ${done} comprado${done > 1 ? "s" : ""}` : ""}${dot}`;
+    const tc = this._$(".t-cont");
+    if (tc) { tc.hidden = !this._contSensor(); tc.classList.toggle("active", !!(this._contMode && this._contMode.type === "send")); }
     const autoCat = this._$(".auto-cat");
     const n = this._autoCatCandidates().length;
     autoCat.hidden = !n;
@@ -2016,6 +2084,197 @@ class ShoppingListPlusCard extends HTMLElement {
     </label>`;
   }
 
+  /* ---------------- Continente (integração ha-continente) ---------------- */
+
+  /** Sensor de preços da integração: o configurado, ou o que segue esta lista. */
+  _contSensor() {
+    const c = this._config && this._config.continente;
+    if (c === false || !this._hass) return null;
+    if (typeof c === "string" && c) return this._hass.states[c] ? c : null;
+    // sem sensor ainda: volta a procurar no máximo a cada minuto (integração instalada depois)
+    if (this._contAutoFor === this._config.entity && (this._contAuto || Date.now() - this._contAutoAt < 60000)) return this._contAuto;
+    this._contAutoAt = Date.now();
+    const id = Object.keys(this._hass.states).find((k) => k.startsWith("sensor.")
+      && this._hass.states[k].attributes.todo_entity === this._config.entity
+      && Array.isArray(this._hass.states[k].attributes.items));
+    this._contAutoFor = this._config.entity;
+    this._contAuto = id || null;
+    return this._contAuto;
+  }
+
+  /** uid -> {product, alternatives, qty, line_total, source} a partir dos atributos do sensor. */
+  _contItems() {
+    if (this._contMap) return this._contMap;
+    const st = this._contState;
+    const map = new Map();
+    if (st && Array.isArray(st.attributes.items)) for (const it of st.attributes.items) map.set(it.uid, it);
+    this._contMap = map;
+    return map;
+  }
+
+  _contTotal() {
+    const st = this._contState;
+    if (!st || st.state === "unavailable" || st.state === "unknown") return null;
+    const v = parseFloat(st.state);
+    return isNaN(v) ? null : v;
+  }
+
+  _priceHtml(it) {
+    if (!this._contSensor()) return "";
+    const c = this._contItems().get(it.uid);
+    if (!c) return `<button class="price pending" type="button" data-action="price" data-uid="${esc(it.uid)}" title="À espera do preço do Continente">…</button>`;
+    const p = c.product;
+    if (!p) return `<button class="price missing" type="button" data-action="price" data-uid="${esc(it.uid)}" title="Não encontrado no Continente: tocar para procurar">?</button>`;
+    const off = p.available === false ? " off" : "";
+    const tip = `${p.name}${p.available === false ? " (esgotado)" : ""} — tocar para trocar`;
+    return `<button class="price${off}${c.source === "escolhido" ? " chosen" : ""}" type="button" data-action="price" data-uid="${esc(it.uid)}" title="${esc(tip)}">${fmtEur(c.line_total ?? p.price)}</button>`;
+  }
+
+  /** Chama uma ação do HA e devolve a resposta (return_response). */
+  async _contCall(service, data) {
+    const res = await this._hass.connection.sendMessagePromise({
+      type: "call_service", domain: "continente", service, service_data: data || {}, return_response: true,
+    });
+    return res && res.response;
+  }
+
+  _openCont(mode) {
+    this._contMode = mode;
+    this._contResult = null;
+    this._contSearch = null;
+    this._renderCont();
+    this._renderCounts();
+    if (mode) {
+      const panel = this._$(".cont-panel");
+      if (panel && panel.scrollIntoView) panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }
+
+  _wireCont() {
+    const panel = this._$(".cont-panel");
+    panel.addEventListener("click", async (e) => {
+      const el = e.target.closest("[data-c]");
+      if (!el || this._contBusy) return;
+      const act = el.dataset.c;
+      if (act === "close") return this._openCont(null);
+      if (act === "swap") return this._openCont({ type: "pick", uid: el.dataset.uid, back: "send" });
+      if (act === "back") return this._openCont({ type: this._contMode.back });
+      const busy = async (fn) => {
+        this._contBusy = true; panel.classList.add("busy");
+        try { await fn(); } catch (err) { this._toast(`Continente: ${(err && err.message) || err}`); }
+        finally { this._contBusy = false; panel.classList.remove("busy"); }
+      };
+      if (act === "choose" || act === "forget") {
+        const raw = this._findRaw(this._contMode.uid);
+        if (!raw) return this._openCont(null);
+        const name = this._parse(raw).name;
+        await busy(async () => {
+          await this._contCall("choose_product", act === "choose" ? { item: name, sku: el.dataset.sku } : { item: name });
+          this._toast(act === "choose" ? `“${name}” vai ser sempre este produto` : `Escolha de “${name}” esquecida`);
+          this._openCont(this._contMode.back ? { type: this._contMode.back } : null);
+        });
+      } else if (act === "find") {
+        const q = (panel.querySelector(".cont-q").value || "").trim();
+        if (q.length < 2) return;
+        await busy(async () => {
+          const r = await this._contCall("search_product", { query: q, limit: 8 });
+          this._contSearch = { q, results: (r && r.results) || [] };
+          this._renderCont();
+        });
+      } else if (act === "send") {
+        await busy(async () => {
+          const r = await this._contCall("send_to_basket", {});
+          this._contResult = r || {};
+          this._renderCont();
+        });
+      }
+    });
+    panel.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && e.target.classList.contains("cont-q")) {
+        e.preventDefault();
+        const b = panel.querySelector('[data-c="find"]');
+        if (b) b.click();
+      }
+    });
+  }
+
+  _prodBtn(p, current) {
+    const off = p.available === false;
+    return `<button class="cont-prod${current ? " current" : ""}${off ? " off" : ""}" type="button" data-c="choose" data-sku="${esc(p.sku)}"${current ? " disabled" : ""}>
+      <span class="cp-name">${esc(p.name)}${off ? " · esgotado" : ""}</span><span class="cp-price">${fmtEur(p.price ?? p.priceEur)}</span></button>`;
+  }
+
+  _renderCont() {
+    const panel = this._$(".cont-panel");
+    if (!panel) return;
+    const mode = this._contMode;
+    if (!mode || !this._contSensor()) { panel.hidden = true; panel.innerHTML = ""; return; }
+    panel.hidden = false;
+    const close = `<button class="cont-x" type="button" data-c="close" aria-label="Fechar">×</button>`;
+    const items = this._contItems();
+
+    if (mode.type === "pick") {
+      const raw = this._findRaw(mode.uid);
+      if (!raw) { panel.hidden = true; return; }
+      const name = this._parse(raw).name;
+      const c = items.get(mode.uid) || {};
+      const cur = c.product;
+      const seen = new Set(cur ? [cur.sku] : []);
+      const alts = (c.alternatives || []).filter((a) => !seen.has(a.sku) && seen.add(a.sku));
+      const found = this._contSearch ? this._contSearch.results.filter((a) => !seen.has(a.sku)) : [];
+      const src = { escolhido: "escolhido por ti", habitual: "dos teus habituais", pesquisa: "pesquisa no catálogo" }[c.source] || "";
+      panel.innerHTML = `
+        <div class="cont-head"><b>Produto para “${esc(name)}”</b>${close}</div>
+        ${cur ? `<div class="cont-sub">Atual${src ? ` (${src})` : ""}:</div>${this._prodBtn(cur, true)}` : `<div class="cont-sub">Ainda sem produto no Continente.</div>`}
+        ${alts.length ? `<div class="cont-sub">Alternativas:</div>${alts.map((a) => this._prodBtn(a)).join("")}` : ""}
+        <div class="cont-search">
+          <input class="field cont-q" type="search" placeholder="Procurar no Continente…" value="${esc(this._contSearch ? this._contSearch.q : name)}" />
+          <button class="toggle" type="button" data-c="find">Procurar</button>
+        </div>
+        ${this._contSearch ? (found.length ? found.map((a) => this._prodBtn(a)).join("") : `<div class="cont-sub">Nada encontrado.</div>`) : ""}
+        <div class="cont-foot">
+          ${mode.back ? `<button class="toggle" type="button" data-c="back">← Voltar</button>` : ""}
+          ${c.source === "escolhido" ? `<button class="toggle" type="button" data-c="forget">Esquecer escolha</button>` : ""}
+        </div>`;
+      return;
+    }
+
+    // envio para o carrinho
+    if (this._contResult) {
+      const r = this._contResult;
+      const added = r.added || [], failed = r.failed || [];
+      const t = r.basket_totals || {};
+      panel.innerHTML = `
+        <div class="cont-head"><b>Carrinho do Continente</b>${close}</div>
+        <div class="cont-ok">✓ ${added.length} produto${added.length === 1 ? "" : "s"} adicionado${added.length === 1 ? "" : "s"} ao carrinho</div>
+        ${failed.length ? `<div class="cont-sub">Não foi possível: ${failed.map((f) => esc(f.name)).join(", ")}</div>` : ""}
+        ${t.totalEur != null ? `<div class="cont-total"><span>Total do carrinho</span><b>${fmtEur(t.totalEur)}</b></div>` : ""}
+        ${t.minOrderEur && t.totalEur < t.minOrderEur ? `<div class="cont-sub">Encomenda mínima: ${fmtEur(t.minOrderEur)}</div>` : ""}
+        <div class="cont-sub">Revê e paga na app ou em <a href="https://www.continente.pt/checkout/carrinho/" target="_blank" rel="noopener">continente.pt</a>. Daqui nunca se fazem encomendas.</div>`;
+      return;
+    }
+    const rows = this._allParsed().filter((i) => !i.done);
+    let n = 0;
+    const lines = rows.map((it) => {
+      const c = items.get(it.uid);
+      const p = c && c.product;
+      if (p && p.available !== false) n += 1;
+      return `<div class="cont-line${p ? (p.available === false ? " off" : "") : " missing"}">
+        <span class="cl-item">${c ? c.qty : it.qty}× ${esc(it.name)}</span>
+        <span class="cl-prod">${p ? esc(p.name) + (p.available === false ? " · esgotado" : "") : "não encontrado"}</span>
+        <span class="cl-price">${p ? fmtEur(c.line_total) : ""}</span>
+        <button class="cl-swap" type="button" data-c="swap" data-uid="${esc(it.uid)}">trocar</button>
+      </div>`;
+    }).join("");
+    const total = this._contTotal();
+    panel.innerHTML = `
+      <div class="cont-head"><b>Enviar para o Continente</b>${close}</div>
+      <div class="cont-lines">${lines || `<div class="cont-sub">Nada por comprar.</div>`}</div>
+      ${total != null ? `<div class="cont-total"><span>Estimativa</span><b>${fmtEur(total)}</b></div>` : ""}
+      <button class="add-btn cont-send" type="button" data-c="send"${n ? "" : " disabled"}>Adicionar ${n} ao carrinho</button>
+      <div class="cont-sub">Os artigos esgotados ou não encontrados ficam de fora. Não faz encomendas.</div>`;
+  }
+
   _rowHtml(it) {
     const uid = esc(it.uid);
     const showBadge = !this._groupByCategory || it.done;
@@ -2025,6 +2284,7 @@ class ShoppingListPlusCard extends HTMLElement {
              aria-label="${it.done ? "Voltar a pôr na lista" : "Marcar como comprado"}">${it.done ? "✓" : ""}</button>
         <div class="name" data-action="edit" data-uid="${uid}" title="Tocar para editar">${esc(it.name)}</div>
         ${showBadge ? this._catSelectHtml(it) : ""}
+        ${it.done ? "" : this._priceHtml(it)}
         <div class="stepper">
           <button class="step" type="button" data-action="dec" data-uid="${uid}" aria-label="Menos">−</button>
           <span class="qty">${(this._qtyDraft && this._qtyDraft.get(it.uid)) || it.qty}</span>
