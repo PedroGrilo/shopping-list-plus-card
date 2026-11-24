@@ -1,5 +1,5 @@
 /**
- * Shopping List Plus Card  —  v1.6
+ * Shopping List Plus Card  —  v1.7
  * Um custom card para o Home Assistant que assenta numa entidade `todo`
  * (ex.: todo.lista_de_compras) com pesquisa, filtros por categoria,
  * agrupamento, quantidades, recomendações e categorização automática.
@@ -30,7 +30,7 @@
  *                                 # ha-continente). Deteta-se sozinho; `continente: false` desliga.
  */
 
-const VERSION = "1.6";
+const VERSION = "1.7";
 const TAG_RE = /#([\p{L}\p{N}_-]+)/gu;               // só para limpar legado
 // prefixo de quantidade: "2x Ovos", "2 x ovos" ou "2 ovos" (sem "x" só se a seguir vier minúscula,
 // para não estragar nomes como "7 Up" ou "100 Montaditos")
@@ -312,6 +312,7 @@ class ShoppingListPlusCard extends HTMLElement {
   disconnectedCallback() {
     document.removeEventListener("visibilitychange", this._onVisible);
     this._editing = null;   // o blur nem sempre dispara ao sair da página (Safari/Firefox)
+    if (this._drag) this._drag.cancel();
     this._teardown();
   }
 
@@ -1277,7 +1278,7 @@ class ShoppingListPlusCard extends HTMLElement {
   _styles() {
     return `
       :host { --slpc-accent: var(--primary-color); --slpc-radius: 12px; display: block; }
-      ha-card { padding: 16px; position: relative; overflow: visible; container-type: inline-size; }
+      ha-card { display: block; padding: 16px; position: relative; overflow: visible; container-type: inline-size; }
       button { font-family: inherit; }
       button:focus-visible { outline: 2px solid var(--slpc-accent); outline-offset: 2px; }
       .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
@@ -1457,6 +1458,33 @@ class ShoppingListPlusCard extends HTMLElement {
       .qty { min-width: 22px; text-align: center; font-size: 0.9rem; color: var(--primary-text-color); }
       .row.done .stepper { display: none; }
       .row.pending { opacity: 0.7; }
+      .row { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+      .row.dragging { opacity: 0.3; }
+      .drag-ghost {
+        position: fixed; z-index: 1001; pointer-events: none; box-sizing: border-box; margin: 0;
+        background: var(--card-background-color, var(--ha-card-background, #fff));
+        box-shadow: 0 12px 32px rgba(0,0,0,0.35); transform: scale(1.03); opacity: 0.95;
+      }
+      .drop-panel {
+        position: fixed; left: 8px; right: 8px; bottom: calc(8px + env(safe-area-inset-bottom, 0px)); z-index: 1000;
+        max-height: 45vh; overflow: auto; padding: 12px; border-radius: 16px;
+        background: var(--card-background-color, var(--ha-card-background, #fff));
+        border: 1px solid var(--divider-color, rgba(127,127,127,0.25));
+        box-shadow: 0 -8px 32px rgba(0,0,0,0.3);
+      }
+      .drop-title { font-size: 0.75rem; color: var(--secondary-text-color); margin: 0 4px 8px; }
+      .drop-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+      .drop {
+        border: 1.5px dashed var(--divider-color, rgba(127,127,127,0.4)); border-radius: 12px;
+        padding: 14px 8px; text-align: center; font-size: 0.88rem; color: var(--primary-text-color);
+        transition: transform 0.1s, background 0.1s, border-color 0.1s; overflow-wrap: anywhere;
+      }
+      .drop.current { opacity: 0.4; }
+      .drop.over, .group-label.over {
+        border-style: solid; border-color: var(--slpc-accent); color: var(--slpc-accent);
+        background: color-mix(in srgb, var(--slpc-accent) 16%, transparent);
+      }
+      .drop.over { transform: scale(1.05); }
       .row.removing { opacity: 0; height: 0; min-height: 0; padding: 0; overflow: hidden; transition: opacity 0.15s; }
       .del {
         flex: 0 0 auto; cursor: pointer; border: none; background: none;
@@ -1478,6 +1506,23 @@ class ShoppingListPlusCard extends HTMLElement {
       .toast-msg { flex: 1; }
       .toast-btn { border: none; background: none; color: var(--slpc-accent); font-weight: 700; cursor: pointer; text-transform: uppercase; font-size: 0.8rem; padding: 4px; }
       @container (min-width: 560px) { .name-wrap { flex: 2 1 200px; } }
+      /* Ecrã estreito (telemóvel): grelha com colunas fixas para os botões, que nunca encolhem
+         nem saltam de linha; o nome usa o espaço que sobra e a categoria passa para baixo dele. */
+      @container (max-width: 459px) {
+        .row {
+          display: grid; grid-template-columns: auto minmax(0, auto) minmax(0, 1fr) auto auto;
+          grid-template-areas: "check name name stepper del" "check badge price stepper del";
+          column-gap: 8px; row-gap: 3px;
+        }
+        .row > .check { grid-area: check; }
+        .row > .name, .row > .edit-input { grid-area: name; min-width: 0; overflow-wrap: break-word; word-break: break-word; }
+        .row > .badge-wrap { grid-area: badge; justify-self: start; max-width: 100%; }
+        .row > .price { grid-area: price; justify-self: start; }
+        .row > .stepper { grid-area: stepper; }
+        .row > .del { grid-area: del; min-width: 32px; min-height: 32px; padding: 0; display: flex; align-items: center; justify-content: center; }
+        .row > .badge-wrap:empty { display: none; }
+        .row:not(:has(> .badge-wrap, > .price)) { grid-template-areas: "check name name stepper del"; }
+      }
     `;
   }
 
@@ -1540,6 +1585,7 @@ class ShoppingListPlusCard extends HTMLElement {
     this._wireAddRow();
     this._wireFilters();
     this._wireList();
+    this._wireDrag();
     this._syncToggles();
   }
 
@@ -1753,6 +1799,7 @@ class ShoppingListPlusCard extends HTMLElement {
   _wireList() {
     const list = this._$(".list");
     list.addEventListener("click", (e) => {
+      if (this._suppressClick) { this._suppressClick = false; return; }   // fim de um arrasto
       const el = e.target.closest("[data-action]");
       if (!el) return;
       const uid = el.dataset.uid;
@@ -1773,14 +1820,123 @@ class ShoppingListPlusCard extends HTMLElement {
         cat = (window.prompt("Nome da nova categoria:") || "").trim();
         if (!cat) { this._renderList(); return; }
       }
-      const raw = this._findRaw(uid);
-      if (!raw) return;
-      const p = this._parse(raw);
-      if (cat) this._addCat(cat);
-      const key = norm(p.effName);
-      if (this._catalog[key]) { this._catalog[key].category = cat; this._saveCatalog(); }
-      this._updateItem({ uid }, { category: cat }).catch(() => {});
+      this._setCategory(uid, cat);
     });
+  }
+
+  /** Muda a categoria de um artigo e lembra-a para a próxima vez. */
+  _setCategory(uid, cat) {
+    const raw = this._findRaw(uid);
+    if (!raw) return Promise.resolve();
+    const p = this._parse(raw);
+    if (cat) this._addCat(cat);
+    const key = norm(p.effName);
+    if (this._catalog[key]) { this._catalog[key].category = cat; this._saveCatalog(); }
+    return this._updateItem({ uid }, { category: cat }).catch(() => {});
+  }
+
+  /* ---------------- Arrastar para mudar de categoria ---------------- */
+
+  /** Manter premido um artigo (~0,4 s) e arrastá-lo para uma categoria do painel ou para um grupo. */
+  _wireDrag() {
+    const list = this._$(".list");
+    const HOLD = 420;
+    const SLOP = 10;
+    let press = null;
+    const cancelPress = () => {
+      if (!press) return;
+      clearTimeout(press.timer);
+      press = null;
+      this._press = false;
+      // render adiado durante o toque; espera pelo click (um toque curto abre a edição)
+      if (this._renderSkipped) setTimeout(() => this._renderList(), 350);
+    };
+    list.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || this._editing || this._drag) return;
+      const row = e.target.closest(".row");
+      if (!row || e.target.closest("button, select, input, label")) return;
+      const ref = row.querySelector("[data-uid]");
+      if (!ref) return;
+      cancelPress();
+      press = { id: e.pointerId, x: e.clientX, y: e.clientY, row, uid: ref.dataset.uid };
+      this._press = true;
+      press.timer = setTimeout(() => { const p = press; press = null; this._press = false; if (p) this._startDrag(p); }, HOLD);
+    });
+    list.addEventListener("pointermove", (e) => {
+      if (press && e.pointerId === press.id && Math.hypot(e.clientX - press.x, e.clientY - press.y) > SLOP) cancelPress();
+    });
+    list.addEventListener("pointerup", cancelPress);
+    list.addEventListener("pointercancel", cancelPress);
+    // durante o arrasto o dedo não faz scroll, e o menu de toque longo não aparece
+    list.addEventListener("touchmove", (e) => { if (this._drag) e.preventDefault(); }, { passive: false });
+    list.addEventListener("contextmenu", (e) => { if (this._drag || press) e.preventDefault(); });
+  }
+
+  _startDrag({ id, x, y, row, uid }) {
+    const raw = this._findRaw(uid);
+    if (!raw || !row.isConnected || this._editing) { this._renderList(); return; }
+    const it = this._parse(raw);
+    if (navigator.vibrate) navigator.vibrate(15);
+    const rect = row.getBoundingClientRect();
+    const ghost = row.cloneNode(true);
+    ghost.classList.add("drag-ghost");
+    Object.assign(ghost.style, { width: `${rect.width}px`, left: `${rect.left}px`, top: `${rect.top}px` });
+    const panel = this._dropPanel(it);
+    this.shadowRoot.append(ghost, panel);
+    row.classList.add("dragging");
+    const offX = x - rect.left;
+    const offY = rect.height + 12;   // o artigo fica acima do dedo, para se ver onde se larga
+    let over = null;
+    const move = (e) => {
+      if (e.pointerId !== id) return;
+      if (e.cancelable) e.preventDefault();
+      ghost.style.left = `${e.clientX - offX}px`;
+      ghost.style.top = `${e.clientY - offY}px`;
+      const el = this.shadowRoot.elementFromPoint(e.clientX, e.clientY);
+      const t = el && el.closest("[data-drop]:not(.current)");
+      if (t === over) return;
+      if (over) over.classList.remove("over");
+      over = t;
+      if (over) { over.classList.add("over"); if (navigator.vibrate) navigator.vibrate(5); }
+    };
+    const finish = (target) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      ghost.remove();
+      panel.remove();
+      row.classList.remove("dragging");
+      this._drag = null;
+      this._suppressClick = true;   // o click que vem a seguir ao largar não abre a edição
+      setTimeout(() => { this._suppressClick = false; }, 400);
+      if (target) {
+        const cat = target.dataset.drop === UNCAT ? "" : target.dataset.drop;
+        if (norm(cat) !== it.catKey) {
+          this._setCategory(uid, cat);
+          this._toast(`“${it.name}” → ${cat || "sem categoria"}`);
+        }
+      }
+      this._renderDynamic();
+    };
+    const up = (e) => { if (e.pointerId === id) finish(over); };
+    const cancel = (e) => { if (e.pointerId === id) finish(null); };
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
+    this._drag = { uid, cancel: () => finish(null) };
+  }
+
+  /** Painel fixo no fundo do ecrã com as categorias onde largar o artigo. */
+  _dropPanel(it) {
+    const panel = document.createElement("div");
+    panel.className = "drop-panel";
+    const cats = this._knownCats();
+    const cell = (value, label, current) =>
+      `<div class="drop${current ? " current" : ""}" data-drop="${esc(value)}">${esc(label)}</div>`;
+    panel.innerHTML = `<div class="drop-title">Largar em…</div><div class="drop-grid">${
+      cats.map((c) => cell(c, c, norm(c) === it.catKey)).join("")
+      + cell(UNCAT, "Sem categoria", !it.category)}</div>`;
+    return panel;
   }
 
   /** +/−: mostra logo o novo valor e envia uma só atualização depois de parar de tocar. */
@@ -2010,7 +2166,9 @@ class ShoppingListPlusCard extends HTMLElement {
   _renderList() {
     const list = this._$(".list");
     if (!list) return;
-    if (this._editing) return;   // não destruir a edição em curso; volta a desenhar no fim
+    // não destruir edição, toque longo ou arrasto em curso; volta a desenhar no fim
+    if (this._editing || this._drag || this._press) { this._renderSkipped = true; return; }
+    this._renderSkipped = false;
     const banner = this._$(".banner");
     banner.style.display = "none";
     if (this._error && !this._loaded) {
@@ -2066,7 +2224,7 @@ class ShoppingListPlusCard extends HTMLElement {
     });
     return keys.map((k) => {
       const g = groups.get(k);
-      return `<div class="group-label"><span>${esc(g.label)}</span><span>${g.rows.length}</span></div>`
+      return `<div class="group-label" data-drop="${k === UNCAT ? UNCAT : esc(g.label)}"><span>${esc(g.label)}</span><span>${g.rows.length}</span></div>`
         + g.rows.map((i) => this._rowHtml(i)).join("");
     }).join("");
   }
@@ -2282,7 +2440,7 @@ class ShoppingListPlusCard extends HTMLElement {
       <div class="row${it.done ? " done" : ""}">
         <button class="check${it.done ? " done" : ""}" type="button" data-action="toggle" data-uid="${uid}"
              aria-label="${it.done ? "Voltar a pôr na lista" : "Marcar como comprado"}">${it.done ? "✓" : ""}</button>
-        <div class="name" data-action="edit" data-uid="${uid}" title="Tocar para editar">${esc(it.name)}</div>
+        <div class="name" data-action="edit" data-uid="${uid}" title="Tocar para editar · manter premido e arrastar para mudar de categoria">${esc(it.name)}</div>
         ${showBadge ? this._catSelectHtml(it) : ""}
         ${it.done ? "" : this._priceHtml(it)}
         <div class="stepper">
