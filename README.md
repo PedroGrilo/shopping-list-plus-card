@@ -20,9 +20,11 @@ no backend integration required. The UI is in Portuguese.
   quantity; adding something already bought puts it back on the list.
 - **Autocomplete** that ignores accents (`acucar` finds *Açúcar*).
 - Tap a name to rename it; tap the category badge to change it.
-- **Drag to change category**: press and hold an item, then drag it onto a
-  category in the panel that opens at the bottom of the screen (or onto a
-  group heading when grouped by category).
+- **Drag to change category**: with "Agrupar" on, press and hold an item and
+  drag it up or down into another category group; the list scrolls by itself
+  near the top/bottom of the screen, and categories with nothing on the list
+  show up as empty groups while you drag. Without grouping (or for bought
+  items) a panel with the categories opens at the bottom of the screen.
 - On phones each row keeps its buttons in fixed columns, and the category
   moves under the name, so long names never push the × off the row.
 - Undo for delete and for "Limpar comprados" (clear bought items).

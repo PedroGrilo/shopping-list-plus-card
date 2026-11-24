@@ -1,5 +1,5 @@
 /**
- * Shopping List Plus Card  —  v1.7
+ * Shopping List Plus Card  —  v1.8
  * Um custom card para o Home Assistant que assenta numa entidade `todo`
  * (ex.: todo.lista_de_compras) com pesquisa, filtros por categoria,
  * agrupamento, quantidades, recomendações e categorização automática.
@@ -30,7 +30,7 @@
  *                                 # ha-continente). Deteta-se sozinho; `continente: false` desliga.
  */
 
-const VERSION = "1.7";
+const VERSION = "1.8";
 const TAG_RE = /#([\p{L}\p{N}_-]+)/gu;               // só para limpar legado
 // prefixo de quantidade: "2x Ovos", "2 x ovos" ou "2 ovos" (sem "x" só se a seguir vier minúscula,
 // para não estragar nomes como "7 Up" ou "100 Montaditos")
@@ -1485,6 +1485,11 @@ class ShoppingListPlusCard extends HTMLElement {
         background: color-mix(in srgb, var(--slpc-accent) 16%, transparent);
       }
       .drop.over { transform: scale(1.05); }
+      .row.dragging { pointer-events: none; }
+      .group { border-radius: 12px; transition: background 0.12s, box-shadow 0.12s; }
+      .group.over { background: color-mix(in srgb, var(--slpc-accent) 8%, transparent); box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--slpc-accent) 55%, transparent); }
+      .group.over > .group-label { color: var(--slpc-accent); }
+      .empty-group { min-height: 44px; }
       .row.removing { opacity: 0; height: 0; min-height: 0; padding: 0; overflow: hidden; transition: opacity 0.15s; }
       .del {
         flex: 0 0 auto; cursor: pointer; border: none; background: none;
@@ -1872,40 +1877,94 @@ class ShoppingListPlusCard extends HTMLElement {
     list.addEventListener("contextmenu", (e) => { if (this._drag || press) e.preventDefault(); });
   }
 
-  _startDrag({ id, x, y, row, uid }) {
+  /**
+   * Arrasto de um artigo. Vista agrupada: a linha anda pela lista e muda de grupo
+   * (para cima ou para baixo, com scroll automático). Sem grupos: painel de categorias.
+   */
+  _startDrag({ id, x, row, uid }) {
     const raw = this._findRaw(uid);
     if (!raw || !row.isConnected || this._editing) { this._renderList(); return; }
     const it = this._parse(raw);
+    const inList = this._groupByCategory && !it.done && !!row.closest(".group");
     if (navigator.vibrate) navigator.vibrate(15);
     const rect = row.getBoundingClientRect();
     const ghost = row.cloneNode(true);
     ghost.classList.add("drag-ghost");
     Object.assign(ghost.style, { width: `${rect.width}px`, left: `${rect.left}px`, top: `${rect.top}px` });
-    const panel = this._dropPanel(it);
-    this.shadowRoot.append(ghost, panel);
+    const panel = inList ? null : this._dropPanel(it);
+    const extra = inList ? this._addEmptyGroups() : [];
+    this.shadowRoot.append(...[ghost, panel].filter(Boolean));
     row.classList.add("dragging");
+    const home = row.closest(".group");
+    if (home) home.classList.add("over");
     const offX = x - rect.left;
     const offY = rect.height + 12;   // o artigo fica acima do dedo, para se ver onde se larga
-    let over = null;
-    const move = (e) => {
-      if (e.pointerId !== id) return;
-      if (e.cancelable) e.preventDefault();
-      ghost.style.left = `${e.clientX - offX}px`;
-      ghost.style.top = `${e.clientY - offY}px`;
-      const el = this.shadowRoot.elementFromPoint(e.clientX, e.clientY);
-      const t = el && el.closest("[data-drop]:not(.current)");
+    const scroller = this._scrollParent();
+    // a "scroll anchoring" do browser compensaria a linha a mudar de sítio e anularia o scroll automático
+    const prevAnchor = scroller.style.overflowAnchor;
+    scroller.style.overflowAnchor = "none";
+    let lastX = x;
+    let lastY = 0;
+    let over = home;
+    let raf = 0;
+
+    const setOver = (t) => {
       if (t === over) return;
       if (over) over.classList.remove("over");
       over = t;
       if (over) { over.classList.add("over"); if (navigator.vibrate) navigator.vibrate(5); }
     };
-    const finish = (target) => {
+    const update = () => {
+      ghost.style.left = `${lastX - offX}px`;
+      ghost.style.top = `${lastY - offY}px`;
+      const el = this.shadowRoot.elementFromPoint(lastX, lastY);
+      if (!inList) { setOver(el && el.closest("[data-drop]:not(.current)")); return; }
+      const g = el && el.closest(".group[data-drop]");
+      if (!g) return;   // fora dos grupos: fica onde estava
+      const r = el.closest(".row");
+      if (r && r !== row && g.contains(r)) {
+        const rb = r.getBoundingClientRect();
+        if (lastY > rb.top + rb.height / 2) { if (r.nextElementSibling !== row) r.after(row); }
+        else if (r.previousElementSibling !== row) r.before(row);
+      } else if (!g.contains(row)) {
+        g.querySelector(".group-label").after(row);
+      }
+      setOver(row.closest(".group"));
+    };
+    // scroll automático quando o dedo está perto do topo ou do fundo do ecrã
+    const tick = () => {
+      raf = 0;
+      if (!this._drag) return;
+      const edge = 80;
+      const vh = window.innerHeight;
+      let dy = 0;
+      if (lastY < edge) dy = -Math.ceil((edge - lastY) / 5);
+      else if (lastY > vh - edge) dy = Math.ceil((lastY - (vh - edge)) / 5);
+      if (!dy) return;
+      scroller.scrollBy(0, dy);
+      update();
+      raf = requestAnimationFrame(tick);
+    };
+    const move = (e) => {
+      if (e.pointerId !== id) return;
+      if (e.cancelable) e.preventDefault();
+      lastX = e.clientX;
+      lastY = e.clientY;
+      update();
+      if (!raf) raf = requestAnimationFrame(tick);
+    };
+    const finish = (drop) => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", cancel);
+      cancelAnimationFrame(raf);
+      scroller.style.overflowAnchor = prevAnchor;
       ghost.remove();
-      panel.remove();
+      if (panel) panel.remove();
+      if (over) over.classList.remove("over");
       row.classList.remove("dragging");
+      const target = drop ? (inList ? row.closest(".group") : over) : null;
+      extra.forEach((g) => g.remove());
       this._drag = null;
       this._suppressClick = true;   // o click que vem a seguir ao largar não abre a edição
       setTimeout(() => { this._suppressClick = false; }, 400);
@@ -1918,12 +1977,51 @@ class ShoppingListPlusCard extends HTMLElement {
       }
       this._renderDynamic();
     };
-    const up = (e) => { if (e.pointerId === id) finish(over); };
-    const cancel = (e) => { if (e.pointerId === id) finish(null); };
+    const up = (e) => { if (e.pointerId === id) finish(true); };
+    const cancel = (e) => { if (e.pointerId === id) finish(false); };
     window.addEventListener("pointermove", move, { passive: false });
     window.addEventListener("pointerup", up);
     window.addEventListener("pointercancel", cancel);
-    this._drag = { uid, cancel: () => finish(null) };
+    this._drag = { uid, cancel: () => finish(false) };
+  }
+
+  /** Durante o arrasto, as categorias sem artigos por comprar aparecem como grupos vazios. */
+  _addEmptyGroups() {
+    const list = this._$(".list");
+    const groups = [...list.querySelectorAll(".group[data-drop]")];
+    const have = new Set(groups.map((g) => (g.dataset.drop === UNCAT ? UNCAT : norm(g.dataset.drop))));
+    const added = [];
+    const all = this._knownCats().map((c) => [norm(c), c]).concat([[UNCAT, "Sem categoria"]]);
+    for (const [key, label] of all) {
+      if (have.has(key)) continue;
+      const g = document.createElement("div");
+      g.className = "group empty-group";
+      g.dataset.drop = key === UNCAT ? UNCAT : label;
+      g.innerHTML = `<div class="group-label"><span>${esc(label)}</span><span>0</span></div>`;
+      const before = key === UNCAT ? null : groups.find((o) => o.dataset.drop === UNCAT
+        || o.dataset.drop.localeCompare(label, "pt") > 0);
+      const anchor = before || list.querySelector(".group-label.done-label");
+      if (anchor) anchor.before(g);
+      else if (groups.length) groups[groups.length - 1].after(g);
+      else list.prepend(g);
+      groups.push(g);
+      groups.sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+      added.push(g);
+    }
+    return added;
+  }
+
+  /** Elemento que faz scroll à volta do card (no HA pode não ser a janela). */
+  _scrollParent() {
+    let n = this.parentNode || this.getRootNode().host;
+    while (n && n !== document) {
+      if (n instanceof Element) {
+        const oy = getComputedStyle(n).overflowY;
+        if ((oy === "auto" || oy === "scroll") && n.scrollHeight > n.clientHeight) return n;
+      }
+      n = n.assignedSlot || n.parentNode || (n instanceof ShadowRoot ? n.host : null);
+    }
+    return document.scrollingElement || document.documentElement;
   }
 
   /** Painel fixo no fundo do ecrã com as categorias onde largar o artigo. */
@@ -2224,8 +2322,9 @@ class ShoppingListPlusCard extends HTMLElement {
     });
     return keys.map((k) => {
       const g = groups.get(k);
-      return `<div class="group-label" data-drop="${k === UNCAT ? UNCAT : esc(g.label)}"><span>${esc(g.label)}</span><span>${g.rows.length}</span></div>`
-        + g.rows.map((i) => this._rowHtml(i)).join("");
+      return `<div class="group" data-drop="${k === UNCAT ? UNCAT : esc(g.label)}">`
+        + `<div class="group-label"><span>${esc(g.label)}</span><span>${g.rows.length}</span></div>`
+        + g.rows.map((i) => this._rowHtml(i)).join("") + `</div>`;
     }).join("");
   }
 
